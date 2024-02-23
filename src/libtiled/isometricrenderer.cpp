@@ -342,7 +342,7 @@ void IsometricRenderer::drawMapObject(QPainter *painter,
         QRectF bounds = { pixelToScreenCoords(object->position()), object->size() };
         bounds.translate(-alignmentOffset(bounds, object->alignment(map())));
 
-        CellRenderer(painter, this, object->objectGroup()->effectiveTintColor())
+        CellRenderer(painter, this, object->objectGroup()->effectiveTintColor(), object->objectGroup()->palette())
                 .render(cell, bounds.topLeft(), bounds.size());
 
         if (testFlag(ShowTileObjectOutlines)) {

@@ -240,6 +240,14 @@ public:
     bool isImageLayer() const { return mLayerType == ImageLayerType; }
     bool isGroupLayer() const { return mLayerType == GroupLayerType; }
 
+    int palette() const {
+      const QString propName = QString::fromUtf8("pal");
+      if (!hasProperty(propName)) {
+        return 0;
+      }
+      return property(propName).toInt();
+    }
+
     // These actually return this layer cast to one of its subclasses.
     TileLayer *asTileLayer();
     ObjectGroup *asObjectGroup();

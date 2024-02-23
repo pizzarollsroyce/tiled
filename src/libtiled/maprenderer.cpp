@@ -47,25 +47,25 @@
 
 using namespace Tiled;
 
-struct TintedKey
+struct PalettedKey
 {
     const qint64 key;
-    const QColor color;
+    const int pal;
 
-    bool operator==(const TintedKey &o) const
+    bool operator==(const PalettedKey &o) const
     {
-        return key == o.key && color == o.color;
+        return key == o.key && pal == o.pal;
     }
 };
 
 #if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
-uint qHash(const TintedKey &key, uint seed) Q_DECL_NOTHROW
+uint qHash(const PalettedKey &key, uint seed) Q_DECL_NOTHROW
 #else
-size_t qHash(const TintedKey &key, size_t seed) Q_DECL_NOTHROW
+size_t qHash(const PalettedKey &key, size_t seed) Q_DECL_NOTHROW
 #endif
 {
     auto h = ::qHash(key.key, seed);
-    h = ::qHash(key.color.rgba(), h);
+    h = ::qHash(key.pal, h);
     return h;
 }
 
@@ -80,42 +80,55 @@ static inline qsizetype cost(const QPixmap &pixmap)
     return static_cast<qsizetype>(qBound(1LL, costKb, costMax));
 }
 
-static QPixmap tinted(const QPixmap &pixmap, const QColor &color)
+namespace {
+  constexpr uint8_t TRANSPARENT = 0;
+  constexpr uint8_t OPAQUE_BLACK = 16;
+  constexpr uint8_t PAL_MAP[4][4] {
+    {TRANSPARENT, 85, 170, 255}, // Pal 0
+    {TRANSPARENT, OPAQUE_BLACK, 170, 255}, // Pal 1
+    {TRANSPARENT, OPAQUE_BLACK, 85, 255}, // Pal 2
+    {TRANSPARENT, OPAQUE_BLACK, 85, 170}, // Pal 3
+  };
+  uint8_t transformColorVal(uint8_t original, uint8_t pal) {
+    if (pal > 3) {
+      return original;
+    }
+    return PAL_MAP[pal][original >> 6];
+  }
+}
+
+static QPixmap applyPalette(const QPixmap &pixmap, int palette)
 {
-    if (!color.isValid() || color == QColor(255, 255, 255, 255) || pixmap.isNull())
-        return pixmap;
 
-    // Cache for up to 100 MB of tinted pixmaps, since tinting is expensive
-    static QCache<TintedKey, QPixmap> cache { 100 * 1024 };
+    if (palette < 0 || palette > 3) {
+      // Invalid palette
+      return pixmap;
+    }
 
-    const TintedKey tintedKey { pixmap.cacheKey(), color };
-    if (auto cached = cache.object(tintedKey))
+    // Cache for up to 100 MB of applyPalette pixmaps, since tinting is expensive
+    static QCache<PalettedKey, QPixmap> cache { 100 * 1024 };
+
+    const PalettedKey applyPaletteKey { pixmap.cacheKey(), palette };
+    if (auto cached = cache.object(applyPaletteKey))
         return *cached;
 
-    QPixmap resultImage = pixmap;
-    QPainter painter(&resultImage);
+    QImage resultImage = pixmap.toImage();
 
-    QColor fullOpacity = color;
-    fullOpacity.setAlpha(255);
-    // tint the final color (this will will mess up the alpha which we will fix
-    // in the next lines)
-    painter.setCompositionMode(QPainter::CompositionMode_Multiply);
-    painter.fillRect(resultImage.rect(), fullOpacity);
+    for (int x = 0; x < resultImage.width(); x++) {
+      for (int y = 0; y < resultImage.height(); y++) {
+        auto rgb = resultImage.pixel(x, y);
+        // Make it red like on VB
+        resultImage.setPixel(x, y, qRgb(
+              transformColorVal(qRed(rgb), palette), 0, 0));
+      }
+    }
 
-    // apply the original alpha to the final image
-    painter.setCompositionMode(QPainter::CompositionMode_DestinationIn);
-    painter.drawPixmap(0, 0, pixmap);
+    QPixmap resultPixmap;
+    resultPixmap.convertFromImage(resultImage);
 
-    // apply the alpha of the tint color so that we can use it to make the image
-    // transparent instead of just increasing or decreasing the tint effect
-    painter.setCompositionMode(QPainter::CompositionMode_DestinationIn);
-    painter.fillRect(resultImage.rect(), color);
+    cache.insert(applyPaletteKey, new QPixmap(resultPixmap), cost(resultPixmap));
 
-    painter.end();
-
-    cache.insert(tintedKey, new QPixmap(resultImage), cost(resultImage));
-
-    return resultImage;
+    return resultPixmap;
 }
 
 MapRenderer::~MapRenderer()
@@ -171,7 +184,7 @@ void MapRenderer::drawImageLayer(QPainter *painter,
                                  const QRectF &exposed) const
 {
     painter->save();
-    painter->setBrush(tinted(imageLayer->image(), imageLayer->effectiveTintColor()));
+    painter->setBrush(applyPalette(imageLayer->image(), imageLayer->palette()));
     painter->setPen(Qt::NoPen);
     if (exposed.isNull())
         painter->drawRect(boundingRect(imageLayer));
@@ -269,7 +282,7 @@ void MapRenderer::drawTileLayer(QPainter *painter, const TileLayer *layer, const
                 drawMargins.left(),
                 drawMargins.top());
 
-    CellRenderer renderer(painter, this, layer->effectiveTintColor());
+    CellRenderer renderer(painter, this, layer->effectiveTintColor(), layer->palette());
 
     auto tileRenderFunction = [layer, &renderer, tileSize](QPoint tilePos, const QPointF &screenPos) {
         const Cell &cell = layer->cellAt(tilePos - layer->position());
@@ -388,12 +401,13 @@ static bool hasOpenGLEngine(const QPainter *painter)
     return false;
 }
 
-CellRenderer::CellRenderer(QPainter *painter, const MapRenderer *renderer, const QColor &tintColor)
+CellRenderer::CellRenderer(QPainter *painter, const MapRenderer *renderer, const QColor &tintColor, const int palette)
     : mPainter(painter)
     , mRenderer(renderer)
     , mTile(nullptr)
     , mIsOpenGL(hasOpenGLEngine(painter))
     , mTintColor(tintColor)
+    , mPalette(palette)
 {
 }
 
@@ -520,7 +534,7 @@ void CellRenderer::render(const Cell &cell, const QPointF &screenPos, const QSiz
                         fragment.width, fragment.height);
 
     mPainter->setTransform(transform);
-    mPainter->drawPixmap(target, tinted(image, mTintColor), source);
+    mPainter->drawPixmap(target, applyPalette(image, mPalette), source);
     mPainter->setTransform(oldTransform);
 
     // A bit of a hack to still draw tile collision shapes when requested
@@ -545,7 +559,7 @@ void CellRenderer::flush()
 
     mPainter->drawPixmapFragments(mFragments.constData(),
                                   mFragments.size(),
-                                  tinted(mTile->image(), mTintColor));
+                                  applyPalette(mTile->image(), mPalette));
 
     if (mRenderer->flags().testFlag(ShowTileCollisionShapes)
             && mTile->objectGroup()
